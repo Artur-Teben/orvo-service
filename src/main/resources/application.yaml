@@ -1,0 +1,17 @@
+spring:
+  application:
+    name: orvo-service
+  mvc:
+    servlet:
+      path: /api
+  jpa:
+    database: postgresql
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate.dialect: org.hibernate.dialect.PostgreSQLDialect
+  datasource:
+    url: jdbc:postgresql://${PG_HOST:localhost}:${PG_PORT:5432}/${PG_DATABASE:orvo-service}
+    username: ${PG_USERNAME:admin}
+    password: ${PG_PASSWORD:admin}
+    driver-class-name: org.postgresql.Driver
