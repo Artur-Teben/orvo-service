@@ -10,83 +10,107 @@ import javax.naming.directory.Attribute;
 import javax.naming.directory.Attributes;
 import javax.naming.directory.DirContext;
 import javax.naming.directory.InitialDirContext;
-import java.util.*;
+import java.util.AbstractMap;
+import java.util.Hashtable;
+import java.util.Map;
+import java.util.Optional;
+import java.util.PriorityQueue;
+import java.util.Queue;
 
 /**
- * Service for performing DNS lookups to retrieve MX (Mail Exchange) records.
- *
- * <p>This class encapsulates the DNS lookup logic using JNDI. It provides methods to retrieve
- * the MX host with the highest priority for a given domain.</p>
+ * Service for performing DNS lookups to retrieve MX (Mail Exchange) records,
+ * with a fallback to A record if no MX records are found.
  */
 @Slf4j
 @Service
 public class DnsLookupService {
 
+    private static final String DNS_CONTEXT_FACTORY = "com.sun.jndi.dns.DnsContextFactory";
+    private static final String DNS_PREFIX = "dns:/";
+    private static final String MX_RECORD_TYPE = "MX";
+
     /**
-     * Retrieves the MX server for the specified domain.
+     * Retrieves the mail server (MX or, if none, A record) for the specified domain.
      *
-     * <p>This method performs a DNS lookup for MX records of the given domain. It validates the input,
-     * performs the DNS query, sorts the found records by priority, and returns the MX host with the highest priority.</p>
-     *
-     * @param domain the domain name to lookup the MX record for; must not be {@code null} or empty
-     * @return an {@code Optional} containing the MX host if successful; otherwise, an empty Optional
+     * @param domain the domain name to lookup the mail server for
+     * @return an Optional containing the mail server host if found
      */
-    public Optional<String> getMXServer(String domain) {
+    public Optional<String> getMailServer(String domain) {
         if (domain == null || domain.isEmpty()) {
             log.warn("Domain must not be null or empty");
             return Optional.empty();
         }
 
-        // Setup JNDI DNS lookup
-        Hashtable<String, String> env = new Hashtable<>();
-        env.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.dns.DnsContextFactory");
-        DirContext context = null;
-
         try {
-            context = new InitialDirContext(env);
+            DirContext context = createDnsContext();
 
-            // Retrieve MX records
-            Attributes attributes = context.getAttributes("dns:/" + domain, new String[]{"MX"});
-            Attribute servers = attributes.get("MX");
+            // First, attempt to get MX records.
+            Optional<String> mxServer = getMXRecord(context, domain);
 
-            if (servers == null) {
-                return Optional.empty();
+            if (mxServer.isPresent()) {
+                return mxServer;
             }
-
-            Queue<Map.Entry<Integer, String>> mxHeap = new PriorityQueue<>(Map.Entry.comparingByKey());
-
-            // Parse and store MX records
-            NamingEnumeration<?> hostsWithPriorities = servers.getAll();
-
-            while (hostsWithPriorities.hasMore()) {
-                String record = hostsWithPriorities.next().toString().trim();
-                String[] parts = record.split("\\s+", 2);
-
-                if (parts.length < 2) {
-                    continue;
-                }
-
-                try {
-                    Integer priority = Integer.valueOf(parts[0].trim());
-                    String mxHost = parts[1].trim();
-                    mxHeap.add(new AbstractMap.SimpleEntry<>(priority, mxHost));
-                } catch (NumberFormatException e) {
-                    log.warn("Skipping record with invalid priority: {}", record);
-                }
-            }
-
-            return !mxHeap.isEmpty() ? Optional.of(mxHeap.poll().getValue()) : Optional.empty();
+            // Fallback to A record if no MX records are found.
+            log.warn("No MX records found for {}. Falling back to A record.", domain);
+            return getARecord(context, domain);
         } catch (NamingException e) {
-            log.error("MX server for {} wasn't found. En error occurred: {}", domain, e.getMessage());
+            log.error("Error during mail server lookup for {}: {}", domain, e.getMessage());
             return Optional.empty();
-        } finally {
-            if (context != null) {
-                try {
-                    context.close();
-                } catch (NamingException e) {
-                    log.warn("Failed to close DirContext", e);
-                }
-            }
         }
     }
+
+    private DirContext createDnsContext() throws NamingException {
+        Hashtable<String, String> env = new Hashtable<>();
+        env.put(Context.INITIAL_CONTEXT_FACTORY, DNS_CONTEXT_FACTORY);
+        return new InitialDirContext(env);
+    }
+
+    private Optional<String> getMXRecord(DirContext context, String domain) throws NamingException {
+        Attributes attributes = context.getAttributes(DNS_PREFIX + domain, new String[]{MX_RECORD_TYPE});
+        Attribute servers = attributes.get(MX_RECORD_TYPE);
+
+        if (servers == null) {
+            return Optional.empty();
+        }
+        return parseMXRecords(servers);
+    }
+
+    private Optional<String> parseMXRecords(Attribute servers) throws NamingException {
+        Queue<Map.Entry<Integer, String>> mxHeap = new PriorityQueue<>(Map.Entry.comparingByKey());
+        NamingEnumeration<?> hostsWithPriorities = servers.getAll();
+
+        while (hostsWithPriorities.hasMore()) {
+            String record = hostsWithPriorities.next().toString().trim();
+            String[] parts = record.split("\\s+", 2);
+
+            if (parts.length < 2) {
+                continue;
+            }
+
+            try {
+                Integer priority = Integer.valueOf(parts[0].trim());
+                String mxHost = parts[1].trim();
+                mxHeap.add(new AbstractMap.SimpleEntry<>(priority, mxHost));
+            } catch (NumberFormatException e) {
+                log.warn("Skipping record with invalid priority: {}", record);
+            }
+        }
+        return !mxHeap.isEmpty() ? Optional.of(mxHeap.poll().getValue()) : Optional.empty();
+    }
+
+    private Optional<String> getARecord(DirContext context, String domain) throws NamingException {
+        Attributes attributes = context.getAttributes(DNS_PREFIX + domain, new String[]{"A"});
+        Attribute aRecord = attributes.get("A");
+
+        if (aRecord != null) {
+            try {
+                String ipAddress = aRecord.get(0).toString().trim();
+                return Optional.of(ipAddress);
+            } catch (NamingException e) {
+                log.error("Error retrieving A record for {}: {}", domain, e.getMessage());
+            }
+        }
+        return Optional.empty();
+    }
+
 }

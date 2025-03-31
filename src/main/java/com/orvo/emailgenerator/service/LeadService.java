@@ -2,30 +2,26 @@ package com.orvo.emailgenerator.service;
 
 import com.opencsv.CSVReader;
 import com.opencsv.exceptions.CsvException;
-import com.orvo.emailgenerator.model.EmailComponents;
-import com.orvo.emailgenerator.model.LeadResponseDto;
-import com.orvo.emailgenerator.model.MailboxlayerResponse;
-import org.springframework.http.HttpStatus;
-import org.springframework.http.ResponseEntity;
+import com.orvo.emailgenerator.model.*;
+import com.orvo.emailgenerator.model.dto.response.LeadGenerationResponse;
+import com.orvo.emailgenerator.model.dto.response.LeadResponseDto;
+import com.orvo.emailgenerator.model.entity.Lead;
+import com.orvo.emailgenerator.repository.LeadRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.Reader;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
 import java.util.function.Function;
 
+@Slf4j
 @Service
+@RequiredArgsConstructor
 public class LeadService {
-
-    private static final String MAILBOXLAYER_API_KEY = "7229e4484a4b08f32bd196fcf4674dcf";
-    private static final String MAILBOXLAYER_API_URL_TEMPLATE = "https://apilayer.net/api/check?access_key=%s&email=%s";
-
 
     private static final List<Function<EmailComponents, String>> EMAIL_PATTERNS = Arrays.asList(
             // Pattern: {first}.{last}@domain.com
@@ -40,8 +36,11 @@ public class LeadService {
             comp -> comp.getFirstName().toLowerCase() + "." + comp.getLastName().substring(0, 1).toLowerCase() + "@" + comp.getCompanyDomain()
     );
 
+    private final LeadRepository leadRepository;
+    private final DnsLookupService dnsLookupService;
+    private final SmtpEmailVerifier smtpEmailVerifier;
 
-    public List<LeadResponseDto> generateLeads(MultipartFile file) {
+    public LeadGenerationResponse generateLeads(MultipartFile file) {
         List<LeadResponseDto> leads = new ArrayList<>();
 
         try (Reader reader = new InputStreamReader(file.getInputStream())) {
@@ -50,7 +49,7 @@ public class LeadService {
 
             // Validate headers
             if (rows.isEmpty() || !isValidHeader(rows.getFirst())) {
-                throw new IllegalArgumentException("Invalid CSV headers. Expected: first_name, last_name, company_name, [company_domain]");
+                throw new IllegalArgumentException("Invalid CSV headers. Expected: first_name, last_name, company_name, company_domain");
             }
 
             // Process each data row
@@ -64,11 +63,41 @@ public class LeadService {
                 LeadResponseDto dto = generateLead(firstName, lastName, companyName, companyDomain);
                 leads.add(dto);
             }
+
+            UUID batchId = save(leads);
+
+            // Calculate response metrics
+            int totalLeads = leads.size();
+            int validEmails = (int) leads.stream()
+                    .filter(lead -> lead.getStatus().equals(LeadStatus.EMAIL_CREATED.getDescription()))
+                    .count();
+            return LeadGenerationResponse.builder()
+                    .batchId(batchId)
+                    .totalLeads(totalLeads)
+                    .validEmails(validEmails)
+                    .build();
         } catch (IOException | CsvException e) {
             throw new RuntimeException(e);
         }
+    }
 
-        return leads;
+    private UUID save(List<LeadResponseDto> leads) {
+        UUID batchId = UUID.randomUUID();
+
+        List<Lead> entities = leads.stream()
+                .map(dto -> Lead.builder()
+                        .batchId(batchId)
+                        .firstName(dto.getFirstName())
+                        .lastName(dto.getLastName())
+                        .companyName(dto.getCompanyName())
+                        .companyDomain(dto.getCompanyDomain())
+                        .generatedEmail(dto.getGeneratedEmail())
+                        .status(LeadStatus.getLeadStatus(dto.getStatus()))
+                        .build())
+                .toList();
+
+        leadRepository.saveAll(entities);
+        return batchId;
     }
 
     /**
@@ -78,71 +107,85 @@ public class LeadService {
     private String deriveDomainFromCompany(String companyName) {
         // For now, simply return a dummy domain or try a basic conversion.
         // E.g., remove spaces and append ".com"
+        // TODO: Implement a more robust domain derivation logic.
         return companyName.toLowerCase().replaceAll("\\s+", "") + ".com";
     }
 
     private boolean isValidHeader(String[] header) {
-        // Simple check for expected columns
         return header.length >= 3 &&
                 header[0].equalsIgnoreCase("first_name") &&
                 header[1].equalsIgnoreCase("last_name") &&
-                header[2].equalsIgnoreCase("company_name");
+                header[2].equalsIgnoreCase("company_name") &&
+                header[3].equalsIgnoreCase("company_domain");
     }
 
     private LeadResponseDto generateLead(String firstName, String lastName, String companyName, String companyDomain) {
-        // In a real-world scenario, you might call an external verification API here.
-        // For now, simply default to a basic pattern.
         Optional<String> email = generateEmail(EmailComponents.builder()
                 .firstName(firstName)
                 .lastName(lastName)
                 .companyDomain(companyDomain)
                 .build());
 
-        // Here, you could add logic to verify the email and set an appropriate confidence score/status.
         return LeadResponseDto.builder()
                 .firstName(firstName)
                 .lastName(lastName)
                 .companyName(companyName)
                 .companyDomain(companyDomain)
-                .generatedEmail(email.toString())
+                .generatedEmail(email.orElse(null))
+                // TODO: Add logic to set status based on email verification
+                .status(LeadStatus.EMAIL_CREATED.getDescription())
                 .build();
     }
 
     public Optional<String> generateEmail(EmailComponents components) {
         for (Function<EmailComponents, String> pattern : EMAIL_PATTERNS) {
             String candidateEmail = pattern.apply(components);
-            if (isEmailVerified(candidateEmail)) {
+
+            if (isValid(candidateEmail)) {
                 return Optional.of(candidateEmail);
             }
         }
         return Optional.empty();
     }
 
-    private boolean isEmailVerified(String email) {
-        String apiUrl = String.format(MAILBOXLAYER_API_URL_TEMPLATE, MAILBOXLAYER_API_KEY, email);
-        RestTemplate restTemplate = new RestTemplate();
-
-        try {
-            ResponseEntity<MailboxlayerResponse> response =
-                    restTemplate.getForEntity(apiUrl, MailboxlayerResponse.class);
-
-            if (response.getStatusCode() == HttpStatus.OK && response.getBody() != null) {
-                MailboxlayerResponse result = response.getBody();
-
-                // Determine verification based on criteria. For instance:
-                // - Email format is valid
-                // - MX records exist
-                // - SMTP check is true
-                // - And optionally, a high score (e.g., score >= 0.7)
-                if (result.isFormat_valid() && result.isMx_found() && result.isSmtp_check() && result.getScore() >= 0.7f) {
-                    return true;
-                }
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
+    /**
+     * Validates an email address by:
+     *   1. Checking basic format.
+     *   2. Looking up the domain's mail server (MX, with fallback to A record).
+     *   3. Performing an SMTP handshake to see if the server accepts the email.
+     *
+     * @param email the email address to validate
+     * @return true if valid; false otherwise
+     */
+    private boolean isValid(String email) {
+        if (email == null || !email.contains("@")) {
+            log.warn("Invalid email format: {}", email);
+            return false;
         }
 
-        return false;
+        // Extract domain from email.
+        String domain = email.substring(email.indexOf("@") + 1);
+        log.info("Verifying email {} for domain {}", email, domain);
+
+        // Use DnsLookupService to get the mail server.
+        Optional<String> recipientMailServerOpt = dnsLookupService.getMailServer(domain);
+
+        if (recipientMailServerOpt.isEmpty()) {
+            log.warn("No mail server found for domain: {}", domain);
+            return false;
+        }
+
+        String recipientMailServer = recipientMailServerOpt.get();
+        log.info("Found mail server: {} for domain: {}", recipientMailServer, domain);
+
+        boolean smtpValid = smtpEmailVerifier.verifyEmail(recipientMailServer, email);
+
+        if (smtpValid) {
+            log.info("SMTP verification SUCCEEDED for {}\n", email.toUpperCase());
+        } else {
+            log.warn("SMTP verification FAILED for {}\n", email.toUpperCase());
+        }
+        return smtpValid;
     }
 
 }

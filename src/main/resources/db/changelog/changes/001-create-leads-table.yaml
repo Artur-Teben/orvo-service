@@ -1,0 +1,68 @@
+databaseChangeLog:
+  - changeSet:
+      id: 001-create-leads-table
+      author: artur teben
+      changes:
+        - createTable:
+            tableName: leads
+            columns:
+              - column:
+                  name: id
+                  type: bigint
+                  autoIncrement: true
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: batch_id
+                  type: uuid
+                  constraints:
+                    nullable: false
+              - column:
+                  name: first_name
+                  type: varchar(100)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: last_name
+                  type: varchar(100)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: company_name
+                  type: varchar(255)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: company_domain
+                  type: varchar(255)
+              - column:
+                  name: generated_email
+                  type: varchar(255)
+                  constraints:
+                    unique: true
+              - column:
+                  name: status
+                  type: varchar(50)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: created_at
+                  type: timestamp
+                  defaultValueComputed: CURRENT_TIMESTAMP
+                  constraints:
+                    nullable: false
+
+        - createIndex:
+            indexName: idx_leads_batch_id
+            tableName: leads
+            columns:
+              - column:
+                  name: batch_id
+
+        - createIndex:
+            indexName: idx_leads_status
+            tableName: leads
+            columns:
+              - column:
+                  name: status
