@@ -1,6 +1,5 @@
 package com.orvo.emailgenerator.model.entity;
 
-import com.orvo.emailgenerator.model.LeadStatus;
 import jakarta.persistence.*;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -8,32 +7,28 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 import java.time.LocalDateTime;
+import java.util.UUID;
 
 @Entity
-@Table(name = "leads", indexes = {
-        @Index(name = "idx_generated_email", columnList = "generated_email"),
-        @Index(name = "idx_leads_status", columnList = "status")
+@Table(name = "batch_leads", uniqueConstraints = {
+        @UniqueConstraint(columnNames = {"batch_id", "lead_id"})
 })
 @Data
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
-public class Lead {
+public class BatchLead {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    private String firstName;
-    private String lastName;
-    private String companyName;
-    private String companyDomain;
+    @Column(name = "batch_id", nullable = false)
+    private UUID batchId;
 
-    @Column(unique = true)
-    private String generatedEmail;
-
-    @Enumerated(EnumType.STRING)
-    private LeadStatus status;
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "lead_id", nullable = false)
+    private Lead lead;
 
     private LocalDateTime createdAt;
 
@@ -41,5 +36,4 @@ public class Lead {
     public void prePersist() {
         if (createdAt == null) createdAt = LocalDateTime.now();
     }
-
 }

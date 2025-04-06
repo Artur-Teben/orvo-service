@@ -29,3 +29,21 @@ orvo:
       connectiontimeout: 10000
       timeout: 10000
       writetimeout: 10000
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,env
+      cors:
+        allowed-origins: "http://localhost:5173"
+        allowed-methods: GET,POST,PUT,DELETE,OPTIONS
+        allowed-headers: "*"
+        allow-credentials: true
+

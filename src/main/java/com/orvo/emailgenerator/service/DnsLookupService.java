@@ -1,6 +1,7 @@
 package com.orvo.emailgenerator.service;
 
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
 import javax.naming.Context;
@@ -35,6 +36,7 @@ public class DnsLookupService {
      * @param domain the domain name to lookup the mail server for
      * @return an Optional containing the mail server host if found
      */
+    @Cacheable(value = "dnsCache", key = "#domain")
     public Optional<String> getMailServer(String domain) {
         if (domain == null || domain.isEmpty()) {
             log.warn("Domain must not be null or empty");
@@ -66,10 +68,14 @@ public class DnsLookupService {
     }
 
     private Optional<String> getMXRecord(DirContext context, String domain) throws NamingException {
+        log.debug("Looking up MX record for domain: {}", domain);
+
         Attributes attributes = context.getAttributes(DNS_PREFIX + domain, new String[]{MX_RECORD_TYPE});
         Attribute servers = attributes.get(MX_RECORD_TYPE);
 
         if (servers == null) {
+            log.warn("No MX records found for domain: {}", domain);
+
             return Optional.empty();
         }
         return parseMXRecords(servers);
@@ -91,6 +97,7 @@ public class DnsLookupService {
                 Integer priority = Integer.valueOf(parts[0].trim());
                 String mxHost = parts[1].trim();
                 mxHeap.add(new AbstractMap.SimpleEntry<>(priority, mxHost));
+                log.debug("Parsed MX record: {} with priority: {}", mxHost, priority);
             } catch (NumberFormatException e) {
                 log.warn("Skipping record with invalid priority: {}", record);
             }

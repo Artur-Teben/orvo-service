@@ -5,10 +5,11 @@ import lombok.Getter;
 @Getter
 public enum LeadStatus {
 
-    EMAIL_CREATED("Email Created"),
+    EMAIL_CREATED("Created"),
     INSUFFICIENT_COMPANY_INFO("Insufficient Company Info"),
     INCOMPLETE_LEAD_DATA("Incomplete Lead Data"),
-    PROCESSING_ERROR("Processing Error");
+    PROCESSING_ERROR("Processing Error"),
+    EMAIL_FAILED("Failed");
 
     private final String description;
 

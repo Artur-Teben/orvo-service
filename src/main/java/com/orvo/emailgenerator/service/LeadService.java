@@ -5,99 +5,91 @@ import com.opencsv.exceptions.CsvException;
 import com.orvo.emailgenerator.model.*;
 import com.orvo.emailgenerator.model.dto.response.LeadGenerationResponse;
 import com.orvo.emailgenerator.model.dto.response.LeadResponseDto;
+import com.orvo.emailgenerator.model.entity.BatchLead;
 import com.orvo.emailgenerator.model.entity.Lead;
+import com.orvo.emailgenerator.model.mapper.LeadMapper;
+import com.orvo.emailgenerator.repository.BatchLeadRepository;
 import com.orvo.emailgenerator.repository.LeadRepository;
+import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.PrintWriter;
 import java.io.Reader;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
+
+import static com.orvo.emailgenerator.util.Constants.EMAIL_PATTERNS;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class LeadService {
 
-    private static final List<Function<EmailComponents, String>> EMAIL_PATTERNS = Arrays.asList(
-            // Pattern: {first}.{last}@domain.com
-            comp -> comp.getFirstName().toLowerCase() + "." + comp.getLastName().toLowerCase() + "@" + comp.getCompanyDomain(),
-            // Pattern: {first}{last}@domain.com
-            comp -> comp.getFirstName().toLowerCase() + comp.getLastName().toLowerCase() + "@" + comp.getCompanyDomain(),
-            // Pattern: {firstInitial}{last}@domain.com
-            comp -> comp.getFirstName().substring(0, 1).toLowerCase() + comp.getLastName().toLowerCase() + "@" + comp.getCompanyDomain(),
-            // Pattern: {first}@domain.com
-            comp -> comp.getFirstName().toLowerCase() + "@" + comp.getCompanyDomain(),
-            // Pattern: {first}.{lastInitial}@domain.com
-            comp -> comp.getFirstName().toLowerCase() + "." + comp.getLastName().substring(0, 1).toLowerCase() + "@" + comp.getCompanyDomain()
-    );
-
     private final LeadRepository leadRepository;
+    private final BatchLeadRepository batchLeadRepository;
     private final DnsLookupService dnsLookupService;
     private final SmtpEmailVerifier smtpEmailVerifier;
+    private final LeadMapper leadMapper;
 
     public LeadGenerationResponse generateLeads(MultipartFile file) {
-        List<LeadResponseDto> leads = new ArrayList<>();
+        UUID batchId = UUID.randomUUID();
+        log.info("Generating leads from file: {} with batchId: {}", file.getOriginalFilename(), batchId);
+
+        List<CompletableFuture<BatchLead>> futures = new ArrayList<>();
 
         try (Reader reader = new InputStreamReader(file.getInputStream())) {
             CSVReader csvReader = new CSVReader(reader);
             List<String[]> rows = csvReader.readAll();
 
-            // Validate headers
             if (rows.isEmpty() || !isValidHeader(rows.getFirst())) {
-                throw new IllegalArgumentException("Invalid CSV headers. Expected: first_name, last_name, company_name, company_domain");
+                throw new IllegalArgumentException("Invalid CSV headers.");
             }
 
-            // Process each data row
             for (int i = 1; i < rows.size(); i++) {
                 String[] row = rows.get(i);
-                String firstName = row[0];
-                String lastName = row[1];
-                String companyName = row[2];
-                String companyDomain = (row.length > 3 && !row[3].isEmpty()) ? row[3] : deriveDomainFromCompany(companyName);
-
-                LeadResponseDto dto = generateLead(firstName, lastName, companyName, companyDomain);
-                leads.add(dto);
+                futures.add(generateBatchLeadAsync(
+                        row[0],
+                        row[1],
+                        row[2],
+                        (row.length > 3 && !row[3].isEmpty()) ? row[3] : deriveDomainFromCompany(row[2]),
+                        batchId));
             }
 
-            UUID batchId = save(leads);
+            // Wait for all futures to complete
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
 
-            // Calculate response metrics
-            int totalLeads = leads.size();
-            int validEmails = (int) leads.stream()
-                    .filter(lead -> lead.getStatus().equals(LeadStatus.EMAIL_CREATED.getDescription()))
+            // Collect results
+            List<BatchLead> batchLeads = futures.stream()
+                    .map(CompletableFuture::join)
+                    .toList();
+
+            int validEmails = (int) batchLeads.stream()
+                    .filter(bl -> bl.getLead().getStatus().equals(LeadStatus.EMAIL_CREATED))
                     .count();
+
+
+            log.info("Generated {} leads ({} valid)", batchLeads.size(), validEmails);
+
             return LeadGenerationResponse.builder()
                     .batchId(batchId)
-                    .totalLeads(totalLeads)
+                    .totalLeads(batchLeads.size())
                     .validEmails(validEmails)
                     .build();
-        } catch (IOException | CsvException e) {
-            throw new RuntimeException(e);
+
+        } catch (IOException e) {
+            log.error("Lead generation failed due to IO error", e);
+            throw new RuntimeException("Failed to read the file", e);
+        } catch (CsvException e) {
+            log.error("Lead generation failed due to CSV parsing error", e);
+            throw new RuntimeException("Failed to parse the CSV file", e);
         }
-    }
-
-    private UUID save(List<LeadResponseDto> leads) {
-        UUID batchId = UUID.randomUUID();
-
-        List<Lead> entities = leads.stream()
-                .map(dto -> Lead.builder()
-                        .batchId(batchId)
-                        .firstName(dto.getFirstName())
-                        .lastName(dto.getLastName())
-                        .companyName(dto.getCompanyName())
-                        .companyDomain(dto.getCompanyDomain())
-                        .generatedEmail(dto.getGeneratedEmail())
-                        .status(LeadStatus.getLeadStatus(dto.getStatus()))
-                        .build())
-                .toList();
-
-        leadRepository.saveAll(entities);
-        return batchId;
     }
 
     /**
@@ -108,43 +100,70 @@ public class LeadService {
         // For now, simply return a dummy domain or try a basic conversion.
         // E.g., remove spaces and append ".com"
         // TODO: Implement a more robust domain derivation logic.
+        log.debug("Deriving domain from company name: {}", companyName);
         return companyName.toLowerCase().replaceAll("\\s+", "") + ".com";
     }
 
     private boolean isValidHeader(String[] header) {
-        return header.length >= 3 &&
+        log.debug("Validating CSV header: {}", Arrays.toString(header));
+        return header.length >= 4 &&
                 header[0].equalsIgnoreCase("first_name") &&
                 header[1].equalsIgnoreCase("last_name") &&
                 header[2].equalsIgnoreCase("company_name") &&
                 header[3].equalsIgnoreCase("company_domain");
     }
 
-    private LeadResponseDto generateLead(String firstName, String lastName, String companyName, String companyDomain) {
-        Optional<String> email = generateEmail(EmailComponents.builder()
-                .firstName(firstName)
-                .lastName(lastName)
-                .companyDomain(companyDomain)
-                .build());
+    @Async("leadVerificationExecutor")
+    public CompletableFuture<BatchLead> generateBatchLeadAsync(String firstName, String lastName, String companyName, String companyDomain, UUID batchId) {
+        return CompletableFuture.completedFuture(
+                generateBatchLead(firstName, lastName, companyName, companyDomain, batchId)
+        );
+    }
 
-        return LeadResponseDto.builder()
-                .firstName(firstName)
-                .lastName(lastName)
-                .companyName(companyName)
-                .companyDomain(companyDomain)
-                .generatedEmail(email.orElse(null))
-                // TODO: Add logic to set status based on email verification
-                .status(LeadStatus.EMAIL_CREATED.getDescription())
-                .build();
+    private BatchLead generateBatchLead(String firstName, String lastName, String companyName, String companyDomain, UUID batchId) {
+        log.debug("Generating lead for: {} {} at {}", firstName, lastName, companyDomain);
+
+        // Check existing record first
+        Lead lead = leadRepository
+                .findByFirstNameIgnoreCaseAndLastNameIgnoreCase(firstName, lastName)
+                .orElseGet(() -> {
+                    Optional<String> emailOpt = generateEmail(EmailComponents.builder()
+                            .firstName(firstName)
+                            .lastName(lastName)
+                            .companyDomain(companyDomain)
+                            .build());
+
+                    LeadStatus status = emailOpt.isPresent() ? LeadStatus.EMAIL_CREATED : LeadStatus.EMAIL_FAILED;
+
+                    return leadRepository.save(Lead.builder()
+                            .firstName(firstName)
+                            .lastName(lastName)
+                            .companyName(companyName)
+                            .companyDomain(companyDomain)
+                            .generatedEmail(emailOpt.orElse(null))
+                            .status(status)
+                            .build());
+                });
+
+
+        return batchLeadRepository.save(BatchLead.builder()
+                .batchId(batchId)
+                .lead(lead)
+                .build());
     }
 
     public Optional<String> generateEmail(EmailComponents components) {
+        log.debug("Generating email for: {} {}", components.getFirstName(), components.getLastName());
+
         for (Function<EmailComponents, String> pattern : EMAIL_PATTERNS) {
             String candidateEmail = pattern.apply(components);
 
             if (isValid(candidateEmail)) {
+                log.info("Generated valid email: {}", candidateEmail);
                 return Optional.of(candidateEmail);
             }
         }
+        log.warn("Failed to generate valid email for: {} {}", components.getFirstName(), components.getLastName());
         return Optional.empty();
     }
 
@@ -186,6 +205,47 @@ public class LeadService {
             log.warn("SMTP verification FAILED for {}\n", email.toUpperCase());
         }
         return smtpValid;
+    }
+
+    public List<LeadResponseDto> getLeads(String batchId) {
+        log.info("Retrieving leads for batchId: {}", batchId);
+
+        List<BatchLead> batchLeads = batchLeadRepository.findAllByBatchId(UUID.fromString(batchId));
+        List<LeadResponseDto> leads =  batchLeads.stream()
+                .map(bl -> leadMapper.toLeadResponseDto(bl.getLead()))
+                .sorted(Comparator.comparing(LeadResponseDto::getGeneratedEmail, Comparator.nullsLast(Comparator.naturalOrder())))
+                .toList();
+
+        log.info("Retrieved {} leads for batchId: {}", leads.size(), batchId);
+
+        return leads;
+    }
+
+    public void writeLeadsToCsv(String batchId, HttpServletResponse response) {
+        List<BatchLead> batchLeads = batchLeadRepository.findAllByBatchId(UUID.fromString(batchId));
+        List<LeadResponseDto> leads = batchLeads.stream()
+                .map(bl -> leadMapper.toLeadResponseDto(bl.getLead()))
+                .toList();
+
+        try (PrintWriter writer = response.getWriter()) {
+            writer.println("first_name,last_name,company_name,company_domain,generated_email,status");
+
+            for (LeadResponseDto lead : leads) {
+                writer.printf("%s,%s,%s,%s,%s,%s%n",
+                        lead.getFirstName(),
+                        lead.getLastName(),
+                        lead.getCompanyName(),
+                        lead.getCompanyDomain(),
+                        Optional.ofNullable(lead.getGeneratedEmail()).orElse(""),
+                        lead.getStatus()
+                );
+            }
+
+            log.info("CSV file generated successfully for batchId: {}", batchId);
+        } catch (IOException e) {
+            log.error("Error generating CSV file for batchId: {}", batchId, e);
+            throw new RuntimeException("Error writing CSV", e);
+        }
     }
 
 }
